@@ -1,5 +1,6 @@
-// da_watch_face_uploader: Face Uploader for MO YOUNG / DA FIT Smart Watches
-// Using Bluetooth LE (via btleplug)
+// dawfu: Da Watch Face Uploader - Face Uploader for MO YOUNG / DA FIT Smart Watches using Bluetooth LE (via btleplug)
+// Copyright 2022 David Atkinson <david@47k@d47.co> (remove the first @)
+// MIT License
 
 use std::io;
 use std::io::Write;
@@ -24,6 +25,10 @@ use std::convert::TryInto;
 
 const WAIT_TIME: u64 = 10;
 
+
+//
+// UUID constants
+//
 const SU_BATTERY: Uuid = uuid_from_u16(0x180f);         // Battery Service
 const CU_BATTERY: Uuid = uuid_from_u16(0x2a19);         // Battery Level
 
@@ -42,46 +47,104 @@ const _CU_NOTIFYX: Uuid = uuid_from_u16(0xfee1);
 const CU_NOTIFY: Uuid = uuid_from_u16(0xfee3);
 
 
+//
+// IsNotEmpty implementation
+//
+// If clippy is going to suggest that string != "" is LESS clear than !string.is_empty(), 
+// then we'll take it a step further: It would look better as string.is_not_empty()
+//
+pub trait IsNotEmpty {
+    fn is_not_empty(&self) -> bool; 
+}
+
+impl IsNotEmpty for String {
+    fn is_not_empty(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl IsNotEmpty for Vec<u8> {
+    fn is_not_empty(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+
+//
+// Application modes
+//
+#[derive(PartialEq)]
+enum Mode { Help, Info, Upload }
+
+
+//
+// Main function
+//
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
 
     println!("da_watch_face_uploader: Face Uploader for MO YOUNG / DA FIT Smart Watches");
-    let mut pname: String = "".to_string();
-    let mut paddress: String = "".to_string();
-    let mut pfile = "".to_string();
-    let mut verbose = 0;
+    let mut device_name: String = "".to_string();
+    let mut device_address: String = "".to_string();
+    let mut filename: String = "".to_string();
+    let mut verbosity: u32 = 0;    
+
+    let mut _slot: u32 = 13;      // From 1 to 13, counting the watch faces on the watch and in DaFit app. 13 is the Watch Gallery, 6 is the user watch face.
+                                 // When setting watch face, we use 0x0D (13). When specifying slot, we use 0x74 (decimal 116) which is 103d + 13d.
+                                 // When setting watch face 6, we use file 0x6E (decimal 110), which is 104d + 6d.
 
     // process command-line arguments
     let args: Vec<String> = env::args().collect();
-    for i in 0..args.len() {
-        if args[i].contains('=') {
-            let idx = args[i].find('=').unwrap();
-            let lhs = (args[i][0..idx]).to_string();
-            let rhs = (args[i][idx+1..]).to_string();
-            if lhs == "name" {
-                pname = rhs;
-            } else if lhs == "address"  {
-                paddress = rhs;
-            } else if lhs == "file"  {
-                pfile = rhs;
-            } else if lhs == "verbose"  {
-                verbose = rhs.parse::<i32>().unwrap();
-            }
-        } else if args[i].starts_with("help") || args[i].starts_with("-h") || args[i].starts_with("--help") {
-            println!("arguments:");
-            println!("    help                              This help information.");
-            println!("    name=NAME                         Limit to devices matching NAME.");
-            println!("    address=01:23:45:67:89:ab         Limit to devices matching address.");
-            println!("    file=WATCHFACE.BIN                Upload WATCHFACE.BIN.");
-            println!("");
-            return Ok(());
+    let mode: Mode = if args.len() < 2 {
+        Mode::Help
+    } else {
+        match &args[1][..] {
+            "info" => Mode::Info,
+            "upload" => Mode::Upload,
+            _ => Mode::Help,
+        }
+    };
+
+    for arg in args.iter().skip(2) {
+        if arg.contains('=') {
+            let idx = arg.find('=').unwrap();
+            let lhs = (arg[0..idx]).to_string();
+            let rhs = (arg[idx+1..]).to_string();
+            match &lhs[..] {
+                "name"      => device_name      = rhs,
+                "address"   => device_address   = rhs,
+                "verbosity" => verbosity        = rhs.parse::<u32>().unwrap(),
+                _           => filename         = arg.clone(),
+            };
+        } else {
+            filename = arg.clone();
         }
     }
 
+    if mode == Mode::Help {
+        println!("usage: dawfu mode [options] [filename]");
+        println!("mode:        info                        Show device information.");
+        println!("             upload                      Upload a binary watch file.");
+        println!("             help                        Show this help information.");
+        println!("options:     name=MyWatch                Limit to devices with matching name.");
+        println!("             address=01:23:45:67:89:ab   Limit to devices with matching address.");
+        println!("             verbosity=1                 Set debug message verbosity.");
+        println!("filename:                                File to upload.");
+        println!();
+        return Ok(());
+    }
+
     let mut filedata: Vec::<u8> = Vec::new();
-    if pfile != "" { // open the file, read the whole lot to memory
-        filedata = std::fs::read(pfile)?;
+    if filename.is_not_empty() && mode == Mode::Upload { // open the file, read the whole lot to memory
+        filedata = std::fs::read(filename)?;
+        // calculate quick checksum.
+        // I don't actually know what they use for checksum!
+        //let mut sum: i32 = 0;
+        //for i in 0..filedata.len() {
+        //    sum += (filedata[i] as i8) as i32;
+        //}
+        // println!("File checksum: {:08x}", sum);
     }
 
     let manager = Manager::new().await?;
@@ -113,18 +176,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let properties = properties.unwrap();
                 let local_name = properties
                     .local_name
-                    .unwrap_or(String::from("(unknown)"));
+                    .unwrap_or_else(|| String::from("(unknown)"));
                 let address = properties.address.to_string();
                 print!(
                     "Found device [{}]: {}. ", address, local_name
                 );
 
                 // Check if it is the named peripheral
-                if (pname != "" && local_name != pname) || (paddress != "" && address != paddress) {
-                    if verbose > 0 {
+                if (device_name.is_not_empty() && local_name != device_name) || (device_address.is_not_empty() && address != device_address) {
+                    if verbosity > 0 {
                         println!("Skipping.");
                     } else {
-                        println!("");
+                        println!();
                     }
                     continue;
                 } else {
@@ -140,17 +203,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 let is_connected = peripheral.is_connected().await?;
-                if verbose > 0{
+                if verbosity > 0{
                     println!("Connected to {:}...", &local_name);
                 }
 
                 // Discover services
                 peripheral.discover_services().await?;
-                if verbose > 0{
+                if verbosity > 0{
                     println!("Discovering services on {:}...", &local_name);
                 }
 
-                if verbose > 0 {    // Display debug dump of services and readable characteristics
+                if verbosity > 0 {    // Display debug dump of services and readable characteristics
                     for service in peripheral.services() {
                         println!("Service {}    primary: {}", service.uuid.to_short_string(), service.primary);
                         // Print the readable chars to screen
@@ -197,38 +260,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 
                 // Check for all required characteristics
                 let chars = peripheral.characteristics();                
-                let c_uuids: Vec<Uuid> = chars.iter().map(|c| c.uuid).collect();
                 let required_chars = vec!(CU_SOFTREV, CU_SERIALNUM, CU_MANUFACTURER, CU_BATTERY, CU_NOTIFY, CU_SEND, CU_SENDFILE);
-                for c in required_chars {
-                    if !c_uuids.contains(&c) {
+                for rc in required_chars {
+                    if !chars.iter().any(|c| c.uuid==rc) {
                         println!("Device does not have all required characteristics.");
                         continue;
                     }
                 }
 
                 // Read some device info
-                let software_revision;
-                let serial_number;
-                let manufacturer;
-                let battery_level;
                 let mut c: &Characteristic;
                 let mut data: Vec<u8>;
 
                 c = chars.iter().find(|c| c.uuid == CU_SOFTREV).unwrap();
                 data = peripheral.read(c).await?;                    
-                software_revision = String::from_utf8_lossy(&data).into_owned();
+                let software_revision = String::from_utf8_lossy(&data).into_owned();
 
                 c = chars.iter().find(|c| c.uuid == CU_SERIALNUM).unwrap();
                 data = peripheral.read(c).await?;
-                serial_number = String::from_utf8_lossy(&data).into_owned();
+                let serial_number = String::from_utf8_lossy(&data).into_owned();
 
                 c = chars.iter().find(|c| c.uuid == CU_MANUFACTURER).unwrap();
                 data = peripheral.read(c).await?;
-                manufacturer = String::from_utf8_lossy(&data).into_owned();
+                let manufacturer = String::from_utf8_lossy(&data).into_owned();
 
                 c = chars.iter().find(|c| c.uuid == CU_BATTERY).unwrap();
                 data = peripheral.read(c).await?;
-                battery_level = format!("{}", data[0]);
+                let battery_level = format!("{}", data[0]);
 
                 println!("Software Revision: {}", software_revision);
                 println!("Serial Number:     {}", serial_number);
@@ -244,74 +302,81 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 // Subscribe to notifications
                 let cnotify = chars.iter().find(|c| c.uuid == CU_NOTIFY).unwrap();
-                peripheral.subscribe(&cnotify).await?;
+                peripheral.subscribe(cnotify).await?; // clippy removed &
                 let mut notification_stream = peripheral.notifications().await?;
                 
                 let csend = chars.iter().find(|c| c.uuid == CU_SEND).unwrap();
                 let csendfile = chars.iter().find(|c| c.uuid == CU_SENDFILE).unwrap();
 
-                // if we have filedata, send it
-                if filedata.len() > 0 {                    
+                // If we have filedata, send it
+                if filedata.is_not_empty() && mode == Mode::Upload {             
                     const CHUNKSIZE: usize = 244;
                     println!("Sending watch face...");
                     std::io::stdout().flush().unwrap();
 
-                    // send the prep command
+                    // Send the prep command
                     data = vec![ 0xfe, 0xea, 0x20, 0x09, 0x74 ];
                     let fsize: u32 = filedata.len() as u32;
                     data.extend_from_slice(&fsize.to_be_bytes());
-                    if verbose > 0 {
+                    if verbosity > 0 {
                         println!("SEND: {}", data.iter().map(|c| format!("{:02x} ", c)).collect::<String>());
                     }
                     peripheral.write(csend, &data, WriteType::WithoutResponse).await?;
 
-                    // loop until we receive an 'all done' message
+                    let mut expected_num: usize = 0;
+
+                    // Loop until we receive an 'all done' message
                     let mut finished: bool = false;
                     while !finished {                       
-                        if verbose > 0 {
+                        if verbosity > 0 {
                             println!("Waiting for notification...");
                         }
                         let data = match notification_stream.next().await {
                             Some(x) => x.value,
-                            __ => { 
+                            _ => { 
                                 println!("ERROR: reading data from notification"); 
                                 break;
                             },
                         };
 
-                        if verbose > 0 {
+                        if verbosity > 0 {
                             println!("RECV: {}", data.iter().map(|c| format!("{:02x} ", c)).collect::<String>());
                         } 
 
                         if data[0..5] == [ 0xfe, 0xea, 0x20, 0x09, 0x74 ] {             // All done
-                            // I think there is a checksum or something here in the last 4 bytes we are meant to check before telling the watch to go ahead
+                            print!("\x0D{:<5.2} % ", 100);  // 100%
+                            let checksum: u32 = u32::from_be_bytes(data[5..=8 ].try_into()?);
+                            println!("All data recived by watch. Checksum: {:08x} ({})", checksum, checksum as i32);
 
-                            if verbose > 0 {
-                                println!("All data received by watch");
-                            }
                             peripheral.write(csend, &[ 0xfe, 0xea, 0x20, 0x09, 0x74, 0x00, 0x00, 0x00, 0x00 ], WriteType::WithoutResponse).await?;
                             finished = true;
                         } else if data[0..5] == [ 0xfe, 0xea, 0x20, 0x07, 0x74 ] {      // Ready for chunk
-                            let chunknum: usize = (u16::from_be_bytes(data[5..=6].try_into().unwrap())) as usize;
+                            let chunknum: usize = (u16::from_be_bytes(data[5..=6].try_into().unwrap())) as usize;                            
                             let startidx: usize = chunknum * CHUNKSIZE;
                             let mut endidx: usize = startidx + CHUNKSIZE;
+
+                            if chunknum != expected_num {
+                                println!("WARNING: Expected request for chunk {}, got request for chunk {}", expected_num, chunknum);
+                            }
+                            expected_num = chunknum + 1;
                             if endidx > fsize as usize {
                                 endidx = fsize as usize;
                             }
-                            if verbose > 0 {
+                            if verbosity > 0 {
                                 println!("Sending chunk #{}", chunknum);
                             } else {
-                                print!(".");
+                                let pc: f64 = (chunknum * CHUNKSIZE * 100) as f64/ (fsize as f64);
+                                print!("\x0D{:<5.2} % ", pc);
                             }
                             io::stdout().flush().unwrap();
-                            peripheral.write(csendfile, &filedata[startidx..endidx], WriteType::WithoutResponse).await?;  // send requested chunk
+                            peripheral.write(csendfile, &filedata[startidx..endidx], WriteType::WithoutResponse).await?;  // Send requested chunk
                         } else {
                             println!("WARNING: Unexpected data from watch!");
                         }
                     }
                     if finished {
                         println!("File send finished!");
-                        // switch to watch face feea2006190d --- number 13, the custom watch face we stored at file 0x74. File stored at 0x6e is in watch face #6.
+                        // Switch to watch face feea2006190d --- number 13, the custom watch face we stored at file 0x74. File stored at 0x6e is in watch face #6.
                         peripheral.write(csend, &[0xfe, 0xea, 0x20, 0x06, 0x19, 0x0d ], WriteType::WithoutResponse).await?;  // send requested chunk
                     }
                     time::sleep(Duration::from_millis(1000)).await;
