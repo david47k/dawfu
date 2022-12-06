@@ -1,5 +1,5 @@
 [package]
-name = "da_watch_face_uploader"
+name = "dawfu"
 version = "0.1.0"
 authors = ["David Atkinson <david47k@d47.co>"]
 edition = "2018"
