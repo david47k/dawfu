@@ -1,4 +1,5 @@
-// dawfu: Da Watch Face Uploader - Face Uploader for MO YOUNG / DA FIT Smart Watches using Bluetooth LE (via btleplug)
+// dawfu: Da Watch Face Uploader - Face Uploader for MO YOUNG / DA FIT Smart Watches
+// Uses Bluetooth LE (via btleplug)
 // Copyright 2022 David Atkinson <david@47k@d47.co> (remove the first @)
 // MIT License
 
@@ -17,13 +18,16 @@ use btleplug::api::{
     bleuuid::*,
     CharPropFlags,
     WriteType,
-    Characteristic
+    Characteristic,
+    CentralEvent,
 };
-use btleplug::platform::Manager;
+use btleplug::platform::{
+    Manager,
+    PeripheralId, Adapter,
+};
 use std::env;
 use std::convert::TryInto;
 
-const WAIT_TIME: u64 = 10;
 
 
 //
@@ -63,6 +67,12 @@ impl IsNotEmpty for String {
     }
 }
 
+impl IsNotEmpty for &str {
+    fn is_not_empty(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
 impl IsNotEmpty for Vec<u8> {
     fn is_not_empty(&self) -> bool {
         !self.is_empty()
@@ -78,13 +88,148 @@ enum Mode { Help, Info, Upload }
 
 
 //
+// Dump list of peripheral services to screen
+//
+async fn dump_services(pid: &PeripheralId, adapter: &Adapter, verbosity: u32) -> Result<(), Box<dyn Error>> {
+    if verbosity > 0 {    // Display debug dump of services and readable characteristics
+        let peripheral = adapter.peripheral(&pid).await?;
+        for service in peripheral.services() {
+            println!("Service {}    primary: {}", service.uuid.to_short_string(), service.primary);
+            // Print the readable chars to screen
+            for characteristic in service.characteristics {
+                print!("        {}", characteristic.uuid.to_short_string());
+                println!("    {:?}", characteristic.properties);
+                if characteristic.properties.contains(CharPropFlags::READ) {
+                    let data = peripheral.read(&characteristic).await?;
+                    print!("        {}    DATA READ        ", characteristic.uuid.to_short_string());
+                    let mut s: String = String::new();
+                    for zx in data.iter() {
+                        let x = *zx;
+                        print!("{:02x} ", x);
+                        if x > 31 && x < 127 {
+                            let c = x as char;
+                            s.push(c);
+                        } else {
+                            s.push('.');
+                        }
+                    }
+                    print!("    '{}'", s);
+                    if data.len() == 1 {
+                        print!("    {}", u8::from_le_bytes([data[0]]));
+                    } else if data.len() == 2 {
+                        print!("    {}", u16::from_le_bytes([data[0], data[1]]));
+                    } else if data.len() == 4 {
+                        print!("    {}", u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+                    }
+                    println!();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+//
+// Handle DeviceDiscovered events
+//
+async fn device_discovered(pid: &PeripheralId, adapter: &Adapter, wanted_name: &str, wanted_address: &str, verbosity: u32) -> Result<bool, Box<dyn Error>> {
+    let peripheral = adapter.peripheral(&pid).await?;
+    let properties = peripheral.properties().await?;
+    let is_connected = peripheral.is_connected().await?;
+    let properties = properties.unwrap();
+    let local_name = properties
+        .local_name
+        .unwrap_or_else(|| String::from("(unknown)"));
+    let address = properties.address.to_string();
+    print!("Found device [{}]: {}. ", address, local_name);
+    // Check if it is the named peripheral
+    if (wanted_name.is_not_empty() && local_name != wanted_name) || (wanted_address.is_not_empty() && address != wanted_address) {
+        if verbosity > 0 {
+            println!("Skipping.");
+        } else {
+            println!();
+        }
+        return Ok(false);
+    }
+
+    // possible device found
+    // connect and discover services
+    if !is_connected {
+        println!("Connecting... ");
+        if let Err(err) = peripheral.connect().await {
+            eprintln!("Error connecting to peripheral ({}).", err);
+            return Ok(false);
+        }
+    }
+
+    // Discover services
+    peripheral.discover_services().await?;
+    if verbosity > 0{
+        println!("Services on {:}...", &local_name);
+        dump_services(&pid, &adapter, verbosity).await?;
+    }
+
+      // Check that this looks like a DaFit watch
+
+    // Check for all required services
+    let services = peripheral.services();
+    let s_uuids: Vec<Uuid> = services.iter().map(|s| s.uuid).collect();
+    if !(s_uuids.contains(&SU_DEVINFO) && s_uuids.contains(&SU_FEEA) && s_uuids.contains(&SU_BATTERY)) {
+        println!("This doesn't look like a compatible device.");
+        return Ok(false);
+    }
+    
+    // Check for all required characteristics
+    let chars = peripheral.characteristics();                
+    let required_chars = vec!(CU_SOFTREV, CU_SERIALNUM, CU_MANUFACTURER, CU_BATTERY, CU_NOTIFY, CU_SEND, CU_SENDFILE);
+    for rc in required_chars {
+        if !chars.iter().any(|c| c.uuid==rc) {
+            println!("Device does not have all required characteristics.");
+            return Ok(false);
+        }
+    }
+
+    // Read some device info
+    let mut c: &Characteristic;
+    let mut data: Vec<u8>;
+
+    c = chars.iter().find(|c| c.uuid == CU_SOFTREV).unwrap();
+    data = peripheral.read(c).await?;                    
+    let software_revision = String::from_utf8_lossy(&data).into_owned();
+
+    c = chars.iter().find(|c| c.uuid == CU_SERIALNUM).unwrap();
+    data = peripheral.read(c).await?;
+    let serial_number = String::from_utf8_lossy(&data).into_owned();
+
+    c = chars.iter().find(|c| c.uuid == CU_MANUFACTURER).unwrap();
+    data = peripheral.read(c).await?;
+    let manufacturer = String::from_utf8_lossy(&data).into_owned();
+
+    c = chars.iter().find(|c| c.uuid == CU_BATTERY).unwrap();
+    data = peripheral.read(c).await?;
+    let battery_level = format!("{}", data[0]);
+
+    println!("Software Revision: {}", software_revision);
+    println!("Serial Number:     {}", serial_number);
+    println!("Manufacturer:      {}", manufacturer);
+    println!("Battery Level:     {}", battery_level);
+
+    if manufacturer != "MOYOUNG-V2" {
+        println!("This doesn't look like a compatible device.");
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+//
 // Main function
 //
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
 
-    println!("da_watch_face_uploader: Face Uploader for MO YOUNG / DA FIT Smart Watches");
+    println!("dawfu: Da Watch Face Uploader - Face Uploader for MO YOUNG / DA FIT Smart Watches");
     let mut device_name: String = "".to_string();
     let mut device_address: String = "".to_string();
     let mut filename: String = "".to_string();
@@ -158,14 +303,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 
     if adapter_list.len() > 1 {
-        println!("More than one bluetooth adapter found.\n");
+        println!("More than one bluetooth adapter found.");
         for (n,adapter) in adapter_list.iter().enumerate() {
-            println!("Adapter {}: {}\n", n, adapter.adapter_info().await?);
+            println!("Adapter {}: {}", n, adapter.adapter_info().await?);
         }
         if selected_adapter == None {
-            println!("Defaulting to the first adapter. Select adapter with adapter=N argument.\n");
+            println!("Defaulting to the first adapter. Select adapter with adapter=N argument.");
             selected_adapter = Some(0);
         }
+    } else {
+        selected_adapter = Some(0);
     }
 
     let adapter = &adapter_list[selected_adapter.unwrap()];
@@ -174,238 +321,133 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .start_scan(ScanFilter::default())
         .await
         .expect("Can't scan for connected devices with Bluetooth (BLE) adapter!");
-    time::sleep(Duration::from_secs(WAIT_TIME)).await;
+    
+    // Start find device
+    let mut event_stream = adapter.events().await?;
+    let mut watch_device: Option<PeripheralId> = None;
 
-    let peripherals = adapter.peripherals().await?;
-    if peripherals.is_empty() {
-        eprintln!("No BLE peripheral devices found.");
-        return Ok(());
-    }
-
-    // All peripheral devices in range
-    let mut device_found = false;
-    for peripheral in peripherals.iter() {
-        if device_found {
+    let start_instant = std::time::Instant::now();
+    let stop_instant = start_instant + Duration::new(60,0);
+    loop {
+        if std::time::Instant::now() > stop_instant {
+            println!("Timed out.");
             break;
         }
-        let properties = peripheral.properties().await?;
-        let is_connected = peripheral.is_connected().await?;
-        let properties = properties.unwrap();
-        let local_name = properties
-            .local_name
-            .unwrap_or_else(|| String::from("(unknown)"));
-        let address = properties.address.to_string();
-        print!(
-            "Found device [{}]: {}. ", address, local_name
-        );
-
-        // Check if it is the named peripheral
-        if (device_name.is_not_empty() && local_name != device_name) || (device_address.is_not_empty() && address != device_address) {
-            if verbosity > 0 {
-                println!("Skipping.");
-            } else {
-                println!();
-            }
-            continue;
-        } else {
-            device_found = true;
-        }
-
-        // Connect to device
-        if !is_connected {
-            println!("Connecting... ");
-            if let Err(err) = peripheral.connect().await {
-                eprintln!("Error connecting to peripheral ({}).", err);
-                continue;
-            }
-        }
-        let is_connected = peripheral.is_connected().await?;
-        if verbosity > 0{
-            println!("Connected to {:}...", &local_name);
-        }
-
-        // Discover services
-        peripheral.discover_services().await?;
-        if verbosity > 0{
-            println!("Discovering services on {:}...", &local_name);
-        }
-
-        if verbosity > 0 {    // Display debug dump of services and readable characteristics
-            for service in peripheral.services() {
-                println!("Service {}    primary: {}", service.uuid.to_short_string(), service.primary);
-                // Print the readable chars to screen
-                for characteristic in service.characteristics {
-                    print!("        {}", characteristic.uuid.to_short_string());
-                    println!("    {:?}", characteristic.properties);
-                    if characteristic.properties.contains(CharPropFlags::READ) {
-                        let data = peripheral.read(&characteristic).await?;
-                        print!("        {}    DATA READ        ", characteristic.uuid.to_short_string());
-                        let mut s: String = String::new();
-                        for zx in data.iter() {
-                            let x = *zx;
-                            print!("{:02x} ", x);
-                            if x > 31 && x < 127 {
-                                let c = x as char;
-                                s.push(c);
-                            } else {
-                                s.push('.');
-                            }
-                        }
-                        print!("    '{}'", s);
-                        if data.len() == 1 {
-                            print!("    {}", u8::from_le_bytes([data[0]]));
-                        } else if data.len() == 2 {
-                            print!("    {}", u16::from_le_bytes([data[0], data[1]]));
-                        } else if data.len() == 4 {
-                            print!("    {}", u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
-                        }
-                        println!();
-                    }
-                }
-            }
-        }
-    
-        // Check that this looks like a DaFit watch
-
-        // Check for all required services
-        let services = peripheral.services();
-        let s_uuids: Vec<Uuid> = services.iter().map(|s| s.uuid).collect();
-        if !(s_uuids.contains(&SU_DEVINFO) && s_uuids.contains(&SU_FEEA) && s_uuids.contains(&SU_BATTERY)) {
-            println!("This doesn't look like a compatible device.");
+        let event = event_stream.next().await;
+        if event.is_none() {
+            time::sleep(Duration::from_millis(10)).await;
             continue;
         }
-        
-        // Check for all required characteristics
-        let chars = peripheral.characteristics();                
-        let required_chars = vec!(CU_SOFTREV, CU_SERIALNUM, CU_MANUFACTURER, CU_BATTERY, CU_NOTIFY, CU_SEND, CU_SENDFILE);
-        for rc in required_chars {
-            if !chars.iter().any(|c| c.uuid==rc) {
-                println!("Device does not have all required characteristics.");
-                continue;
-            }
-        }
-
-        // Read some device info
-        let mut c: &Characteristic;
-        let mut data: Vec<u8>;
-
-        c = chars.iter().find(|c| c.uuid == CU_SOFTREV).unwrap();
-        data = peripheral.read(c).await?;                    
-        let software_revision = String::from_utf8_lossy(&data).into_owned();
-
-        c = chars.iter().find(|c| c.uuid == CU_SERIALNUM).unwrap();
-        data = peripheral.read(c).await?;
-        let serial_number = String::from_utf8_lossy(&data).into_owned();
-
-        c = chars.iter().find(|c| c.uuid == CU_MANUFACTURER).unwrap();
-        data = peripheral.read(c).await?;
-        let manufacturer = String::from_utf8_lossy(&data).into_owned();
-
-        c = chars.iter().find(|c| c.uuid == CU_BATTERY).unwrap();
-        data = peripheral.read(c).await?;
-        let battery_level = format!("{}", data[0]);
-
-        println!("Software Revision: {}", software_revision);
-        println!("Serial Number:     {}", serial_number);
-        println!("Manufacturer:      {}", manufacturer);
-        println!("Battery Level:     {}", battery_level);
-
-        if manufacturer != "MOYOUNG-V2" {
-            println!("This doesn't look like a compatible device.");
-            continue;
-        }
-
-        device_found = true;
-
-        // Subscribe to notifications
-        let cnotify = chars.iter().find(|c| c.uuid == CU_NOTIFY).unwrap();
-        peripheral.subscribe(cnotify).await?; // clippy removed &
-        let mut notification_stream = peripheral.notifications().await?;
-        
-        let csend = chars.iter().find(|c| c.uuid == CU_SEND).unwrap();
-        let csendfile = chars.iter().find(|c| c.uuid == CU_SENDFILE).unwrap();
-
-        // If we have filedata, send it
-        if filedata.is_not_empty() && mode == Mode::Upload {             
-            const CHUNKSIZE: usize = 244;
-            println!("Sending watch face...");
-            std::io::stdout().flush().unwrap();
-
-            // Send the prep command
-            data = vec![ 0xfe, 0xea, 0x20, 0x09, 0x74 ];
-            let fsize: u32 = filedata.len() as u32;
-            data.extend_from_slice(&fsize.to_be_bytes());
-            if verbosity > 0 {
-                println!("SEND: {}", data.iter().map(|c| format!("{:02x} ", c)).collect::<String>());
-            }
-            peripheral.write(csend, &data, WriteType::WithoutResponse).await?;
-
-            let mut expected_num: usize = 0;
-
-            // Loop until we receive an 'all done' message
-            let mut finished: bool = false;
-            while !finished {                       
-                if verbosity > 0 {
-                    println!("Waiting for notification...");
+        let event = event.unwrap();
+        match event {
+            CentralEvent::DeviceDiscovered(pid) => {
+                if device_discovered(&pid, &adapter, &device_name, &device_address, verbosity).await? {
+                    watch_device = Some(pid);
+                    break;
                 }
-                let data = match notification_stream.next().await {
-                    Some(x) => x.value,
-                    _ => { 
-                        println!("ERROR: reading data from notification"); 
-                        break;
-                    },
-                };
-
-                if verbosity > 0 {
-                    println!("RECV: {}", data.iter().map(|c| format!("{:02x} ", c)).collect::<String>());
-                } 
-
-                if data[0..5] == [ 0xfe, 0xea, 0x20, 0x09, 0x74 ] {             // All done
-                    print!("\x0D{:<5.2} % ", 100);  // 100%
-                    let checksum: u32 = u32::from_be_bytes(data[5..=8 ].try_into()?);
-                    println!("All data recived by watch. Checksum: {:08x} ({})", checksum, checksum as i32);
-
-                    peripheral.write(csend, &[ 0xfe, 0xea, 0x20, 0x09, 0x74, 0x00, 0x00, 0x00, 0x00 ], WriteType::WithoutResponse).await?;
-                    finished = true;
-                } else if data[0..5] == [ 0xfe, 0xea, 0x20, 0x07, 0x74 ] {      // Ready for chunk
-                    let chunknum: usize = (u16::from_be_bytes(data[5..=6].try_into().unwrap())) as usize;                            
-                    let startidx: usize = chunknum * CHUNKSIZE;
-                    let mut endidx: usize = startidx + CHUNKSIZE;
-
-                    if chunknum != expected_num {
-                        println!("WARNING: Expected request for chunk {}, got request for chunk {}", expected_num, chunknum);
-                    }
-                    expected_num = chunknum + 1;
-                    if endidx > fsize as usize {
-                        endidx = fsize as usize;
-                    }
-                    if verbosity > 0 {
-                        println!("Sending chunk #{}", chunknum);
-                    } else {
-                        let pc: f64 = (chunknum * CHUNKSIZE * 100) as f64/ (fsize as f64);
-                        print!("\x0D{:<5.2} % ", pc);
-                    }
-                    io::stdout().flush().unwrap();
-                    peripheral.write(csendfile, &filedata[startidx..endidx], WriteType::WithoutResponse).await?;  // Send requested chunk
-                } else {
-                    println!("WARNING: Unexpected data from watch!");
-                }
-            }
-            if finished {
-                println!("File send finished!");
-                // Switch to watch face feea2006190d --- number 13, the custom watch face we stored at file 0x74. File stored at 0x6e is in watch face #6.
-                peripheral.write(csend, &[0xfe, 0xea, 0x20, 0x06, 0x19, 0x0d ], WriteType::WithoutResponse).await?;  // send requested chunk
-            }
-            time::sleep(Duration::from_millis(1000)).await;
-        }
-
-        if is_connected {
-            println!("Disconnecting from {}.", &local_name);
-            peripheral
-                .disconnect()
-                .await
-                .expect("Error disconnecting from BLE peripheral!");
-        }
+            },
+            _ => {
+                //println!("Recieved unhandled CentralEvent {:?}", event);                
+            },
+        };
     }
+
+    if watch_device.is_none() {
+        println!("Unable to find a watch.");
+        return Ok(());
+    }
+    let peripheral = adapter.peripheral(&watch_device.unwrap()).await?;
+    let chars = peripheral.characteristics();        
+    
+    // Subscribe to notifications
+    let cnotify = chars.iter().find(|c| c.uuid == CU_NOTIFY).unwrap();
+    peripheral.subscribe(cnotify).await?; // clippy removed &
+    let mut notification_stream = peripheral.notifications().await?;
+    
+    let csend = chars.iter().find(|c| c.uuid == CU_SEND).unwrap();
+    let csendfile = chars.iter().find(|c| c.uuid == CU_SENDFILE).unwrap();
+
+    // If we have filedata, send it
+    if filedata.is_not_empty() && mode == Mode::Upload {             
+        const CHUNKSIZE: usize = 244;
+        println!("Sending watch face...");
+        std::io::stdout().flush().unwrap();
+
+        // Send the prep command
+        let mut data = vec![ 0xfe, 0xea, 0x20, 0x09, 0x74 ];
+        let fsize: u32 = filedata.len() as u32;
+        data.extend_from_slice(&fsize.to_be_bytes());
+        if verbosity > 0 {
+            println!("SEND: {}", data.iter().map(|c| format!("{:02x} ", c)).collect::<String>());
+        }
+        peripheral.write(csend, &data, WriteType::WithoutResponse).await?;
+
+        let mut expected_num: usize = 0;
+
+        // Loop until we receive an 'all done' message
+        let mut finished: bool = false;
+        while !finished {                       
+            if verbosity > 0 {
+                println!("Waiting for notification...");
+            }
+            let data = match notification_stream.next().await {
+                Some(x) => x.value,
+                _ => { 
+                    println!("ERROR: reading data from notification"); 
+                    break;
+                },
+            };
+
+            if verbosity > 0 {
+                println!("RECV: {}", data.iter().map(|c| format!("{:02x} ", c)).collect::<String>());
+            } 
+
+            if data[0..5] == [ 0xfe, 0xea, 0x20, 0x09, 0x74 ] {             // All done
+                print!("\x0D{:<5.2} % ", 100);  // 100%
+                let checksum: u32 = u32::from_be_bytes(data[5..=8 ].try_into()?);
+                println!("All data recived by watch. Checksum: {:08x} ({})", checksum, checksum as i32);
+
+                peripheral.write(csend, &[ 0xfe, 0xea, 0x20, 0x09, 0x74, 0x00, 0x00, 0x00, 0x00 ], WriteType::WithoutResponse).await?;
+                finished = true;
+            } else if data[0..5] == [ 0xfe, 0xea, 0x20, 0x07, 0x74 ] {      // Ready for chunk
+                let chunknum: usize = (u16::from_be_bytes(data[5..=6].try_into().unwrap())) as usize;                            
+                let startidx: usize = chunknum * CHUNKSIZE;
+                let mut endidx: usize = startidx + CHUNKSIZE;
+
+                if chunknum != expected_num {
+                    println!("WARNING: Expected request for chunk {}, got request for chunk {}", expected_num, chunknum);
+                }
+                expected_num = chunknum + 1;
+                if endidx > fsize as usize {
+                    endidx = fsize as usize;
+                }
+                if verbosity > 0 {
+                    println!("Sending chunk #{}", chunknum);
+                } else {
+                    let pc: f64 = (chunknum * CHUNKSIZE * 100) as f64/ (fsize as f64);
+                    print!("\x0D{:<5.2} % ", pc);
+                }
+                io::stdout().flush().unwrap();
+                peripheral.write(csendfile, &filedata[startidx..endidx], WriteType::WithoutResponse).await?;  // Send requested chunk
+            } else {
+                println!("WARNING: Unexpected data from watch!");
+            }
+        }
+        if finished {
+            println!("File send finished!");
+            // Switch to watch face feea2006190d --- number 13, the custom watch face we stored at file 0x74. File stored at 0x6e is in watch face #6.
+            peripheral.write(csend, &[0xfe, 0xea, 0x20, 0x06, 0x19, 0x0d ], WriteType::WithoutResponse).await?;  // send requested chunk
+        }
+        time::sleep(Duration::from_millis(1000)).await;
+    }
+
+    if peripheral.is_connected().await? {
+        println!("Disconnecting.");
+        peripheral
+            .disconnect()
+            .await
+            .expect("Error disconnecting from BLE peripheral!");
+    }
+
     Ok(())
 }
