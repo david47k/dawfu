@@ -5,12 +5,12 @@ Uses Bluetooth LE (via [btleplug](https://docs.rs/btleplug/latest/btleplug/)).
 
 It should build on btleplug's supported platforms (Windows 10, macOS, and Linux(BlueZ)).
 
-Copyright 2022 David Atkinson <david@47k@d47.co> (remove the first @)
+Copyright 2022 David Atkinson.
 
-MIT License
+MIT License.
 
 ## Usage
-`
+```
 dawfu: Da Watch Face Uploader - Face Uploader for MO YOUNG / DA FIT Smart Watches
 usage: dawfu mode [options] [filename]
 mode:        info                        Show device information.
@@ -21,7 +21,9 @@ options:     name=MyWatch                Limit to devices with matching name.
              verbosity=1                 Set debug message verbosity.
              adapter=1                   Select which bluetooth adapter to use.
 filename:                                File to upload.
-`
+````
 
 e.g.
-`dawfu upload name=C20 1234.bin`
+```
+dawfu upload name=C20 1234.bin
+```
