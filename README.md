@@ -1,13 +1,12 @@
 
-# dawfu: Da Watch Face Uploader - Face Uploader for MO YOUNG / DA FIT Smart Watches
+# Da Watch Face Uploader (dawfu)
+Face Uploader for MO YOUNG / DA FIT Smart Watches
 
 Uses Bluetooth LE (via [btleplug](https://docs.rs/btleplug/latest/btleplug/)). 
 
-It should build on btleplug's supported platforms (Windows 10, macOS, and Linux(BlueZ)).
+It should build on btleplug's supported platforms (Windows 10, macOS, and Linux).
 
-Copyright 2022 David Atkinson.
-
-MIT License.
+Make sure to disconnect your watch first (it will not work if it already has a bluetooth connection). Easiest to just turn off bluetooth on your phone.
 
 ## Usage
 ```
@@ -25,5 +24,9 @@ filename:                                File to upload.
 
 e.g.
 ```
-dawfu upload name=C20 1234.bin
+dawfu upload 1234.bin
 ```
+
+## License
+
+MIT License.
