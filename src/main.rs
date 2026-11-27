@@ -28,6 +28,8 @@ use btleplug::platform::{
 use std::env;
 use std::convert::TryInto;
 
+mod jieli_crc;
+
 
 
 //
@@ -286,13 +288,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut filedata: Vec::<u8> = Vec::new();
     if filename.is_not_empty() && mode == Mode::Upload { // open the file, read the whole lot to memory
         filedata = std::fs::read(filename)?;
-        // calculate quick checksum.
-        // I don't actually know what they use for checksum!
-        //let mut sum: i32 = 0;
-        //for i in 0..filedata.len() {
-        //    sum += (filedata[i] as i8) as i32;
-        //}
-        //println!("File checksum: {:08x}", sum);
     }
 
     let manager = Manager::new().await?;
@@ -370,6 +365,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // If we have filedata, send it
     if filedata.is_not_empty() && mode == Mode::Upload {             
         const CHUNKSIZE: usize = 244;
+        let expected_crc = jieli_crc::crc16(&filedata);
+        if verbosity > 0 {
+            println!("Local JieLi CRC16: {:04x}", expected_crc);
+        }
         println!("Sending watch face...");
         std::io::stdout().flush().unwrap();
 
@@ -406,6 +405,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 print!("\x0D{:<5.2} % ", 100);  // 100%
                 let checksum: u32 = u32::from_be_bytes(data[5..=8 ].try_into()?);
                 println!("All data recived by watch. Checksum: {:08x} ({})", checksum, checksum as i32);
+                if let Some(received_crc) = jieli_crc::reported_crc(&data) {
+                    if received_crc != expected_crc {
+                        eprintln!("WARNING: JieLi CRC16 mismatch (local {:04x}, watch {:04x}); preserving legacy upload behavior", expected_crc, received_crc);
+                    } else if verbosity > 0 {
+                        println!("JieLi CRC16 matches.");
+                    }
+                }
 
                 peripheral.write(csend, &[ 0xfe, 0xea, 0x20, 0x09, 0x74, 0x00, 0x00, 0x00, 0x00 ], WriteType::WithoutResponse).await?;
                 finished = true;
